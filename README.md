@@ -1,9 +1,9 @@
 # nemlig-mcp
 
 An MCP server that shops groceries at [Nemlig.com](https://www.nemlig.com). It runs
-as a plain Docker container on the homelab and speaks MCP over streamable HTTP, so
-any MCP client on the LAN — Claude Code, Claude Desktop, or the shopping app that
-comes later — can point at one URL and use it.
+as a plain Docker container — on Fly.io as a Claude connector, or on the homelab —
+and speaks MCP over streamable HTTP, so any MCP client — Claude, Claude Code, Claude
+Desktop — can point at one URL and use it.
 
 This is a port of an Azure Functions prototype. Same idea, none of the Azure.
 
@@ -38,7 +38,7 @@ another `/webapi/Token` GET with the stored `.ASPXAUTH` (good for a year), so it
 costs one request; only a lapsed cookie forces a full re-login.
 
 ```
-MCP client ──HTTP──► /mcp ──► session manager ──► Nemlig web API (fetch + JWT)
+MCP client ──HTTP──► /mcp/<secret> ──► session manager ──► Nemlig web API (fetch + JWT)
                                      │
                                      └─ first call only ─► POST /webapi/login
 ```
@@ -89,6 +89,7 @@ a session started by one account is never handed to another.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `MCP_PATH_SECRET` | — | **Required.** The endpoint is `/mcp/<MCP_PATH_SECRET>`; at least 32 characters, or the server will not start. |
 | `NEMLIG_USERNAME` / `NEMLIG_PASSWORD` | — | The default account. Omit both to make the server header-only. |
 | `NEMLIG_ALLOW_HEADER_CREDENTIALS` | `true` | Set `false` to pin the server to the env account. |
 | `NEMLIG_SESSION_READY_TIMEOUT_MS` | `20000` | How long to keep re-minting the token after login while the `debitorId` appears. |
@@ -101,38 +102,89 @@ a session started by one account is never handed to another.
 
 `.env.example` has the rest.
 
-## Running it
+## Access: the secret path
+
+The MCP endpoint lives at `/mcp/<MCP_PATH_SECRET>` and nowhere else. The server
+refuses to start without a secret of at least 32 characters, compares it in
+constant time, and answers a wrong or missing one — including plain `/mcp` — with
+an empty `404`, the same as any path that does not exist. The secret is redacted
+from every logged URL. `/health` stays open for health checks and returns only
+`{status, server, version}`, nothing about the account.
+
+Generate a secret with `openssl rand -hex 32`. Treat the full URL as a password:
+anyone who has it can shop on the account.
+
+## Deploying to Fly.io
+
+`fly.toml` describes the app `uffe-nemlig-mcp` in `arn` (Stockholm): one always-on
+`shared-cpu-1x` machine with 1 GB of memory, HTTPS forced, a health check on
+`/health`, and the volume `nemlig_data` mounted at `/data`. It sets
+`NEMLIG_ALLOW_HEADER_CREDENTIALS=false`, so the server only ever uses the account
+in its secrets.
+
+`.github/workflows/fly-deploy.yml` deploys on every push to `main` and on manual
+dispatch: it runs the tests, creates the app and the 1 GB volume if they do not
+exist yet, and runs `flyctl deploy --remote-only`. It needs one repository secret,
+`FLY_API_TOKEN` (create one with `fly tokens create deploy -a uffe-nemlig-mcp`, or
+`fly tokens create org` before the app exists), under Settings → Secrets and
+variables → Actions.
+
+The server itself needs three Fly secrets. Set them once — the first deploy will
+fail its health check until `MCP_PATH_SECRET` is set:
 
 ```bash
-cp .env.example .env   # fill in NEMLIG_USERNAME and NEMLIG_PASSWORD
+fly secrets set --app uffe-nemlig-mcp \
+  NEMLIG_USERNAME='you@example.com' \
+  NEMLIG_PASSWORD='...' \
+  MCP_PATH_SECRET="$(openssl rand -hex 32)"
+```
+
+| Fly secret | What it is |
+| --- | --- |
+| `NEMLIG_USERNAME` | The Nemlig account's e-mail. |
+| `NEMLIG_PASSWORD` | Its password. |
+| `MCP_PATH_SECRET` | The secret path segment; at least 32 characters. |
+
+Keep the `MCP_PATH_SECRET` you generated — Fly will not show it again. The
+connector URL to give Claude is then:
+
+```
+https://uffe-nemlig-mcp.fly.dev/mcp/<MCP_PATH_SECRET>
+```
+
+Rotating the secret is another `fly secrets set MCP_PATH_SECRET=...`, which
+restarts the machine; the old URL stops working at once.
+
+## Running it on the homelab
+
+```bash
+cp .env.example .env   # fill in NEMLIG_USERNAME, NEMLIG_PASSWORD and MCP_PATH_SECRET
 docker compose up -d --build
 ```
 
 That builds from this working copy and publishes the server directly on
-`http://<host>:8089/mcp`, with `/health` alongside it — the short path for
+`http://<host>:8089/mcp/<MCP_PATH_SECRET>`, with `/health` alongside it — the short path for
 developing on the image.
 
-On the homelab it publishes no port at all. `deploy/docker-compose.yml` runs the
-image CI builds, joins the shared `apps-net` network, and is reached only through
+On the homelab it publishes no port at all. `deploy/docker-compose.yml` builds the
+image from the checkout (CI no longer publishes one), joins the shared `apps-net` network, and is reached only through
 the Caddy reverse proxy that fronts that host:
 
 ```bash
 docker network create apps-net   # once per host
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-The endpoint is then `https://<host>/nemlig/mcp`. Keeping the port unpublished is
+The endpoint is then `https://<host>/nemlig/mcp/<MCP_PATH_SECRET>`. Keeping the port unpublished is
 the point: MCP clients require HTTPS even on the LAN, and a published port would
 leave the plaintext endpoint reachable beside the encrypted one.
 
-There is **no authentication on the MCP endpoint** — it is LAN-only by design, and
-the proxy adds TLS, not access control. Put a Cloudflare tunnel with Access in
-front of it if it ever needs to leave the house.
+The only access control is the secret path; the proxy adds TLS.
 
 ### Behind the proxy
 
 Caddy terminates TLS with its own internal CA and strips the path prefix, so the
-server still sees `/mcp`:
+server still sees `/mcp/<MCP_PATH_SECRET>`:
 
 ```caddyfile
 <host> {
@@ -160,7 +212,7 @@ docker cp caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
 ### Pointing a client at it
 
 ```bash
-claude mcp add --transport http nemlig https://<host>/nemlig/mcp
+claude mcp add --transport http nemlig https://<host>/nemlig/mcp/<MCP_PATH_SECRET>
 ```
 
 MCP clients here run on Node, which does not read the OS trust store by default, so
@@ -172,7 +224,7 @@ host workable, since the variable takes a single file path and not a list.
 Or, to use a different account than the container's:
 
 ```bash
-claude mcp add --transport http nemlig https://<host>/nemlig/mcp \
+claude mcp add --transport http nemlig https://<host>/nemlig/mcp/<MCP_PATH_SECRET> \
   --header "X-Nemlig-Username: you@example.com" \
   --header "X-Nemlig-Password: ..."
 ```

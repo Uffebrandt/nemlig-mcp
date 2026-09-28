@@ -24,12 +24,42 @@ export interface NemligCredentials {
   password: string;
 }
 
+/** Shortest MCP_PATH_SECRET accepted; the path is the only thing guarding the endpoint. */
+export const MIN_PATH_SECRET_LENGTH = 32;
+
+export class InvalidPathSecretError extends Error {
+  constructor(length: number) {
+    super(
+      length === 0
+        ? 'MCP_PATH_SECRET is not set. It guards the public endpoint at /mcp/<secret>; ' +
+            `set it to a random string of at least ${MIN_PATH_SECRET_LENGTH} characters ` +
+            '(e.g. `openssl rand -hex 32`).'
+        : `MCP_PATH_SECRET is too short (${length} characters); it must be at least ` +
+            `${MIN_PATH_SECRET_LENGTH}. Generate one with \`openssl rand -hex 32\`.`,
+    );
+    this.name = 'InvalidPathSecretError';
+  }
+}
+
+/** Returns the secret, or throws when it is missing or too short to be worth guessing. */
+export function requirePathSecret(value: string | undefined): string {
+  const secret = value ?? '';
+  if (secret.length < MIN_PATH_SECRET_LENGTH) throw new InvalidPathSecretError(secret.length);
+  return secret;
+}
+
 const envUsername = str('NEMLIG_USERNAME', '');
 const envPassword = str('NEMLIG_PASSWORD', '');
 
 export const config = {
   host: str('HOST', '0.0.0.0'),
   port: int('PORT', 8080),
+
+  /**
+   * The MCP endpoint is served at /mcp/<secret> only. Read raw here and validated
+   * by requirePathSecret, so a missing one stops the server rather than opening it.
+   */
+  mcpPathSecret: process.env['MCP_PATH_SECRET'] ?? '',
 
   /** Everything that must outlive the container lands here. */
   dataDir: str('NEMLIG_DATA_DIR', 'data'),

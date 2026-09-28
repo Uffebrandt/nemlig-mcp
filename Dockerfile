@@ -37,7 +37,10 @@ ENV NEMLIG_DATA_DIR=/data \
 RUN mkdir -p /data && chown -R node:node /data /app
 VOLUME /data
 
-USER node
+# Starts as root only to hand a root-owned volume to node, then drops to node.
+COPY --chmod=755 nemlig-entrypoint.sh /usr/local/bin/nemlig-entrypoint.sh
+ENTRYPOINT ["nemlig-entrypoint.sh"]
+
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=4s --start-period=8s --retries=3 \

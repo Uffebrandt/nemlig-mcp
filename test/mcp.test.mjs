@@ -2,10 +2,14 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Writable } from 'node:stream';
 import { after, before, describe, it } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { createFakeLogin, createFakeRefresh, startFakeNemlig } from './fake-nemlig.mjs';
+
+// A test value, not a real secret: 40 characters, over the 32 minimum.
+const PATH_SECRET = 'test-path-secret-0123456789abcdefghijklm';
 
 /** Tool results are JSON in a text block; unwrap that once here. */
 function payload(result) {
@@ -34,6 +38,7 @@ describe('nemlig-mcp over streamable HTTP', () => {
     process.env.NEMLIG_USERNAME = 'shopper@example.com';
     process.env.NEMLIG_PASSWORD = 'hunter2';
     process.env.LOG_LEVEL = 'silent';
+    process.env.MCP_PATH_SECRET = PATH_SECRET;
 
     const { SessionStore } = await import('../dist/src/store.js');
     const { SessionManager } = await import('../dist/src/sessions.js');
@@ -44,7 +49,7 @@ describe('nemlig-mcp over streamable HTTP', () => {
     sessions = new SessionManager({ store: await SessionStore.open(dataDir), login, refresh, ttlMs: 60_000 });
     app = createHttpServer(sessions);
     await app.listen({ host: '127.0.0.1', port: 0 });
-    endpoint = new URL('/mcp', `http://127.0.0.1:${app.server.address().port}`);
+    endpoint = new URL(`/mcp/${PATH_SECRET}`, `http://127.0.0.1:${app.server.address().port}`);
   });
 
   after(async () => {
@@ -58,6 +63,78 @@ describe('nemlig-mcp over streamable HTTP', () => {
     await client.connect(new StreamableHTTPClientTransport(endpoint, headers ? { requestInit: { headers } } : undefined));
     return client;
   }
+
+  function initialize(url) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'raw', version: '1' } },
+      }),
+    });
+  }
+
+  it('answers only at /mcp/<secret>, and a bare 404 everywhere else', async () => {
+    const base = `http://127.0.0.1:${app.server.address().port}`;
+    assert.equal((await initialize(endpoint)).status, 200, 'the right secret is served');
+
+    for (const path of ['/mcp', '/mcp/', `/mcp/${PATH_SECRET}x`, `/mcp/${PATH_SECRET.slice(0, -1)}`, '/mcp/nope', '/nope']) {
+      const response = await initialize(new URL(path, base));
+      assert.equal(response.status, 404, `${path} must 404`);
+      assert.equal(await response.text(), '', `${path} must not explain itself`);
+    }
+
+    // A wrong secret is rejected before the body is read, so junk gets 404 too, not 400.
+    const junk = await fetch(new URL('/mcp/nope', base), { method: 'POST', body: '{', headers: { 'Content-Type': 'application/json' } });
+    assert.equal(junk.status, 404);
+    assert.equal((await fetch(new URL('/mcp/nope', base))).status, 404, 'GET with a wrong secret');
+    assert.equal((await fetch(endpoint)).status, 405, 'GET with the right secret is just not allowed');
+  });
+
+  it('keeps /health open without revealing anything about the account', async () => {
+    const response = await fetch(new URL('/health', endpoint));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(Object.keys(body).sort(), ['server', 'status', 'version']);
+    assert.doesNotMatch(JSON.stringify(body), /shopper|credential|header/i);
+  });
+
+  it('refuses to start without a path secret of at least 32 characters', async () => {
+    const { createHttpServer } = await import('../dist/src/server.js');
+    for (const pathSecret of ['', 'x'.repeat(31)]) {
+      assert.throws(() => createHttpServer(sessions, { pathSecret }), /MCP_PATH_SECRET/);
+    }
+  });
+
+  it('never writes the path secret to the log', async () => {
+    const { createHttpServer } = await import('../dist/src/server.js');
+    let log = '';
+    const logStream = new Writable({
+      write(chunk, _encoding, done) {
+        log += chunk;
+        done();
+      },
+    });
+
+    const previous = process.env.LOG_LEVEL;
+    process.env.LOG_LEVEL = 'trace';
+    const logged = createHttpServer(sessions, { logStream });
+    process.env.LOG_LEVEL = previous;
+    await logged.listen({ host: '127.0.0.1', port: 0 });
+    const base = `http://127.0.0.1:${logged.server.address().port}`;
+
+    assert.equal((await initialize(new URL(`/mcp/${PATH_SECRET}?q=${PATH_SECRET}`, base))).status, 200);
+    await initialize(new URL(`/mcp/${PATH_SECRET}x`, base));
+    await fetch(new URL(`/elsewhere/${PATH_SECRET}`, base));
+    await logged.close();
+
+    assert.match(log, /\/mcp\/\[redacted\]/, 'requests are logged, with the path redacted');
+    assert.ok(!log.includes(PATH_SECRET), 'the secret must not appear anywhere in the log');
+    assert.ok(!log.includes(PATH_SECRET.slice(0, 16)), 'not even part of it');
+  });
 
   it('logs in over plain HTTP, no browser, and gets a debitorId token', async () => {
     const { login } = await import('../dist/src/nemlig/login.js');
@@ -471,7 +548,7 @@ describe('nemlig-mcp over streamable HTTP', () => {
 
     const reconnected = new Client({ name: 'test', version: '1.0.0' });
     await reconnected.connect(
-      new StreamableHTTPClientTransport(new URL('/mcp', `http://127.0.0.1:${restartedApp.server.address().port}`)),
+      new StreamableHTTPClientTransport(new URL(`/mcp/${PATH_SECRET}`, `http://127.0.0.1:${restartedApp.server.address().port}`)),
     );
     const result = payload(await reconnected.callTool({ name: 'get_basket', arguments: { sessionId } }));
 
@@ -500,7 +577,7 @@ describe('nemlig-mcp over streamable HTTP', () => {
 
     const client = new Client({ name: 'test', version: '1.0.0' });
     await client.connect(
-      new StreamableHTTPClientTransport(new URL('/mcp', `http://127.0.0.1:${brokenApp.server.address().port}`)),
+      new StreamableHTTPClientTransport(new URL(`/mcp/${PATH_SECRET}`, `http://127.0.0.1:${brokenApp.server.address().port}`)),
     );
     const result = payload(await client.callTool({ name: 'get_basket', arguments: {} }));
     assert.match(result.sessionId, /^[0-9a-f]{12}$/, 'a session is created and usable despite the unwritable store');

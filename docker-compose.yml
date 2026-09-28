@@ -8,8 +8,7 @@ services:
     container_name: nemlig-mcp
     restart: unless-stopped
     ports:
-      # LAN only. The MCP endpoint has no auth — put a Cloudflare tunnel with
-      # Access in front of it if you ever want it from outside the house.
+      # LAN only. The endpoint is /mcp/<MCP_PATH_SECRET>; everything else 404s.
       - "8089:8080"
     volumes:
       - nemlig-mcp-data:/data
@@ -17,6 +16,7 @@ services:
       TZ: Europe/Copenhagen
       NEMLIG_USERNAME: ${NEMLIG_USERNAME:?set NEMLIG_USERNAME in .env}
       NEMLIG_PASSWORD: ${NEMLIG_PASSWORD:?set NEMLIG_PASSWORD in .env}
+      MCP_PATH_SECRET: ${MCP_PATH_SECRET:?set MCP_PATH_SECRET in .env}
 
 volumes:
   nemlig-mcp-data:
